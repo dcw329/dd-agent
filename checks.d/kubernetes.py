@@ -423,16 +423,43 @@ class Kubernetes(AgentCheck):
         node_ip, node_name = self.kubeutil.get_node_info()
         self.log.debug('Processing events on {} [{}]'.format(node_name, node_ip))
 
-        k8s_namespace = instance.get('namespace', 'default')
-        events_endpoint = '{}/namespaces/{}/events'.format(self.kubeutil.kubernetes_api_url, k8s_namespace)
+        default_namespaces = ['default']
+        k8s_namespaces = instance.get('namespaces', default_namespaces)
+        if not isinstance(k8s_namespaces, list):
+            self.log.warning('Configuration key "namespaces" is not a list: fallback to the default value')
+            k8s_namespaces = default_namespaces
+
+        # handle old config value
+        if 'namespace' in instance and instance.get('namespace') not in (None, 'default'):
+            k8s_namespaces.append(instance.get('namespace'))
+
+        k8s_namespace_regexp = instance.get('namespace_name_regexp', None)
+        if k8s_namespace_regexp:
+            try:
+                regexp = re.compile(k8s_namespace_regexp)
+            except re.error as e:
+                self.log.warning('Invalid regexp for "namespace_name_regexp" in configuration (ignoring regexp): %s' % str(e))
+            else:
+                namespaces_endpoint = '{}/namespaces'.format(self.kubeutil.kubernetes_api_url)
+                self.log.debug('Kubernetes API endpoint to query namespaces: %s' % namespaces_endpoint)
+
+                namespaces = self.kubeutil.retrieve_json_auth(namespaces_endpoint, self.kubeutil.get_auth_token())
+                for namespace in namespaces.get('items', []):
+                    name = namespace.get('metadata', {}).get('name', None)
+                    if name and regexp.match(name):
+                        k8s_namespaces.append(name)
+
+        k8s_namespaces = set(k8s_namespaces)
+
+        events_endpoint = '{}/events'.format(self.kubeutil.kubernetes_api_url)
         self.log.debug('Kubernetes API endpoint to query events: %s' % events_endpoint)
 
         events = self.kubeutil.retrieve_json_auth(events_endpoint, self.kubeutil.get_auth_token())
         event_items = events.get('items') or []
-        last_read = self.kubeutil.last_event_collection_ts[k8s_namespace]
+        last_read = self.kubeutil.last_event_collection_ts
         most_recent_read = 0
 
-        self.log.debug('Found {} events, filtering out using timestamp: {}'.format(len(event_items), last_read))
+        self.log.debug('Found {} events, filtering out using timestamp: {} and namespaces: {}'.format(len(event_items), last_read, k8s_namespaces))
 
         for event in event_items:
             # skip if the event is too old
@@ -441,6 +468,10 @@ class Kubernetes(AgentCheck):
                 continue
 
             involved_obj = event.get('involvedObject', {})
+
+            # filter events by white listed namespaces (empty namespace belong to the 'default' one)
+            if involved_obj.get('namespace', 'default') not in k8s_namespaces:
+                continue
 
             tags = self.kubeutil.extract_event_tags(event)
 
@@ -467,5 +498,5 @@ class Kubernetes(AgentCheck):
             self.event(dd_event)
 
         if most_recent_read > 0:
-            self.kubeutil.last_event_collection_ts[k8s_namespace] = most_recent_read
-            self.log.debug('_last_event_collection_ts is now {}'.format(most_recent_read))
+            self.kubeutil.last_event_collection_ts = most_recent_read
+            self.log.debug('last_event_collection_ts is now {}'.format(most_recent_read))
